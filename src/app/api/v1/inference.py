@@ -1,8 +1,11 @@
 from typing import List, Optional, Dict, Any, Literal
 from math import fabs
 from fastapi import APIRouter, HTTPException  # type: ignore
-from pydantic import BaseModel, Field  # type: ignore
+from pydantic import BaseModel, Field, validator  # type: ignore
 import random
+from pathlib import Path
+import json as _json
+import glob
 
 router = APIRouter(tags=["v1"])
 
@@ -17,12 +20,25 @@ class BBox(BaseModel):
 
 
 class InferenceRequest(BaseModel):
-    bbox: BBox
+    bbox: List[float] = Field(..., min_items=4, max_items=4,
+                              description="Bounding box coordinates [min_lon, min_lat, max_lon, max_lat]")
     budget: float = Field(..., ge=0, description="Budget in project currency")
     preferences: Optional[Dict[str, Any]] = Field(
         default_factory=dict, description="Optional preferences from the frontend"
     )
     max_suggestions: int = Field(6, ge=1, le=50)
+
+    @validator("bbox")
+    def validate_bbox(cls, v):
+        if len(v) != 4:
+            raise ValueError(
+                "bbox must be [min_lon, min_lat, max_lon, max_lat]")
+        min_lon, min_lat, max_lon, max_lat = v
+        if min_lon >= max_lon:
+            raise ValueError("min_lon must be less than max_lon")
+        if min_lat >= max_lat:
+            raise ValueError("min_lat must be less than max_lat")
+        return v
 
 
 class Suggestion(BaseModel):
@@ -103,22 +119,68 @@ def _generate_suggestions(bbox: BBox, budget: float, max_suggestions: int, prefs
     return suggestions, {"area_km2": round(area_km2, 6)}
 
 
-@router.post("/v1/infer", response_model=InferenceResponse, summary="Get build suggestions for an area and budget")
+@router.post("/v1/infer", response_model=InferenceResponse, summary="Get build suggestions for an area and budget", status_code=200)
 async def infer(req: InferenceRequest):
     """Return a list of suggestions/plans for the selected area and budget.
 
-    The frontend should POST a JSON body with `bbox` and `budget` plus optional
-    `preferences`. The response contains scored suggestions the frontend can show
-    on the map and allow users to select and drill into details.
+    Parameters:
+    - bbox: array[4] - Bounding box coordinates [min_lon, min_lat, max_lon, max_lat]
+      - min_lon: float - Minimum longitude (western bound)
+      - min_lat: float - Minimum latitude (southern bound)
+      - max_lon: float - Maximum longitude (eastern bound)
+      - max_lat: float - Maximum latitude (northern bound)
+      Example: [36.5, -1.5, 37.0, -1.0]
+
+    - budget: float - Available budget in project currency (must be >= 0)
+    - preferences: object (optional) - Additional preferences for suggestion generation
+    - max_suggestions: int - Maximum number of suggestions to return (1-50, default: 6)
+
+    Returns:
+    200 OK: List of scored suggestions with metadata
+
+    Raises:
+    400 Bad Request:
+    - If bbox is not exactly [min_lon, min_lat, max_lon, max_lat]
+    - If min_lon >= max_lon or min_lat >= max_lat
+    - If budget is negative
+
+    The endpoint uses GeoJSON data containing recommended build locations with properties:
+    - estimated_cost: Estimated construction cost in project currency
+    - urgency_score_normalized: Priority score (0-1) indicating need/urgency
+    - impact_per_1k_usd: Impact metric per $1000 spent
+    - mean_population: Average population in the area
+    - mean_solar_potential: Solar resource potential
+    - recommendation: Recommended building/infrastructure type
+    - notes/justification: Explanation of the recommendation
+
+    Alternative property names are supported for compatibility:
+    - Cost: estimated_cost, predicted_cost, cost_usd, etc.
+    - Urgency: urgency_score, urgency_normalized
+    - Impact: impact_per_1k, benefit_per_1k_usd, impact_est
+
+    If no GeoJSON data is available, the endpoint falls back to generating
+    synthetic suggestions based on area and budget constraints.
     """
-    bbox = req.bbox
+    min_lon, min_lat, max_lon, max_lat = req.bbox
     budget = req.budget
 
-    if bbox.min_lon >= bbox.max_lon or bbox.min_lat >= bbox.max_lat:
-        raise HTTPException(status_code=400, detail="Invalid bbox coordinates")
+    bbox = BBox(
+        min_lon=min_lon,
+        min_lat=min_lat,
+        max_lon=max_lon,
+        max_lat=max_lat
+    )
 
-    suggestions, meta = _generate_suggestions(
-        bbox, budget, req.max_suggestions, req.preferences)
+    # Try to load Turkana sample features and derive suggestions from them
+    sample_feats = _load_turkana_sample()
+    if sample_feats:
+        suggestions = _suggestions_from_features(
+            sample_feats, bbox=bbox, max_suggestions=req.max_suggestions)
+        meta = {"source": "turkana_sample", "area_km2": round(
+            _area_size_approx_km2(bbox), 6)}
+    else:
+        suggestions, meta = _generate_suggestions(
+            bbox, budget, req.max_suggestions, req.preferences)
 
     # also provide a GeoJSON FeatureCollection of suggestion centroids and render hints
     suggestion_centroids = _suggestions_to_featurecollection(
@@ -256,8 +318,33 @@ def _point_within_region(point: Dict[str, float], region: Dict[str, Any]) -> boo
 
 
 # New endpoint: propose region-aware suggestions
-@router.post("/v1/propose_region", response_model=InferenceResponse, summary="Get suggestions constrained to an arbitrary region (circle, polygon, bbox)")
+@router.post("/v1/propose_region", response_model=InferenceResponse, summary="Get build suggestions constrained to a specific region")
 async def propose_region(req: ProposeRequest):
+    """Get build suggestions constrained to a specific region shape.
+
+    Supports three region types:
+    - circle: Defined by center point (lon,lat) and radius_m in meters
+    - polygon: Defined by list of [lon,lat] coordinates forming a closed shape
+    - bbox: Simple bounding box with min/max lon/lat
+
+    The endpoint will:
+    1. Find all GeoJSON features (build recommendations) that fall within the region
+    2. Score them based on urgency, impact and cost metrics
+    3. Filter and sort suggestions by score
+    4. If no features found in region, fall back to nearest features by distance
+
+    The suggestion scoring considers:
+    - Urgency score (0-1) from urgency_score_normalized or similar fields
+    - Impact per cost from impact_per_1k_usd or similar impact metrics
+    - Estimated build cost relative to provided budget
+    - For fallback suggestions: distance from region center
+
+    Response includes:
+    - Scored and ranked suggestions with locations and metadata
+    - Original feature properties (population, solar potential, etc.)
+    - GeoJSON outputs for map visualization
+    - Layer-specific styling hints for the frontend
+    """
     region = req.region
     budget = req.budget
 
@@ -265,14 +352,12 @@ async def propose_region(req: ProposeRequest):
         raise HTTPException(
             status_code=400, detail="Region must be provided and include a 'type' field (circle|polygon|bbox)")
 
-    # Reuse generation to create candidate suggestions across the bounding box of the region
-    # Derive a bbox for sampling if possible
+    # Derive a sampling bbox for spatial queries (unchanged from before)
     sample_bbox = None
     if region.get("type") == "bbox":
         sample_bbox = BBox(**region.get("bbox"))
     elif region.get("type") == "circle":
         c = region.get("center")
-        # small bbox around center approximating radius in degrees (very rough)
         radius_km = float(region.get("radius_m", 0)) / 1000.0
         deg = radius_km / 111.0
         sample_bbox = BBox(min_lon=c["lon"] - deg, min_lat=c["lat"] -
@@ -286,7 +371,76 @@ async def propose_region(req: ProposeRequest):
     else:
         raise HTTPException(status_code=400, detail="Unknown region type")
 
-    # generate candidates using same prefs
+    # If Turkana sample available, use it as candidate pool and filter by region
+    sample_feats = _load_turkana_sample()
+    if sample_feats:
+        # filter features by region
+        candidates = []
+        for f in sample_feats:
+            coords = _feature_point_coords(f)
+            if not coords:
+                continue
+            if _point_within_region(coords, region):
+                candidates.append(f)
+        # build suggestions from the features inside region
+        filtered_suggestions = _suggestions_from_features(
+            candidates, bbox=None, max_suggestions=req.max_suggestions)
+        if not filtered_suggestions:
+            # no features inside region; fall back to nearest features by distance to region center
+            # compute region center
+            region_center = None
+            if region.get("type") == "circle":
+                region_center = region.get("center")
+            elif region.get("type") == "bbox":
+                b = region.get("bbox")
+                region_center = {"lon": (
+                    b["min_lon"] + b["max_lon"]) / 2.0, "lat": (b["min_lat"] + b["max_lat"]) / 2.0}
+            else:
+                b = sample_bbox
+                region_center = {
+                    "lon": (b.min_lon + b.max_lon) / 2.0, "lat": (b.min_lat + b.max_lat) / 2.0}
+            # annotate distance and sort
+            feat_with_dist = []
+            for f in sample_feats:
+                coords = _feature_point_coords(f)
+                if not coords:
+                    continue
+                d = haversine_distance_km(
+                    coords["lon"], coords["lat"], region_center["lon"], region_center["lat"]) * 1000.0
+                feat_with_dist.append((d, f))
+            feat_with_dist.sort(key=lambda x: x[0])
+            near_feats = [f for _, f in feat_with_dist[: req.max_suggestions]]
+            filtered_suggestions = _suggestions_from_features(
+                near_feats, bbox=None, max_suggestions=req.max_suggestions)
+
+        # assemble layers from provided features in region (if any were supplied in request)
+        provided = req.features or []
+        layers = {"amenities": [], "infrastructure": [], "data": []}
+        for feat in provided:
+            coords = _feature_point_coords(feat)
+            if not coords:
+                continue
+            if _point_within_region(coords, region):
+                layers[_feature_layer(feat)].append(
+                    {"lon": coords["lon"], "lat": coords["lat"], "properties": feat.properties})
+
+        meta_out = {"source": "turkana_sample", "region_type": region.get("type"), "area_bbox": [
+            sample_bbox.min_lon, sample_bbox.min_lat, sample_bbox.max_lon, sample_bbox.max_lat]}
+
+        suggestion_centroids = _suggestions_to_featurecollection(
+            filtered_suggestions, bbox=sample_bbox)
+        render_hints = {
+            "suggestions": {"marker_color": "#8A2BE2", "marker_radius": 7},
+            "amenities": {"marker_color": "#FF8C00", "marker_radius": 6},
+            "infrastructure": {"marker_color": "#0077BE", "marker_radius": 6},
+            "data": {"marker_color": "#4CAF50", "marker_radius": 5},
+        }
+        meta_out["suggestion_centroids"] = suggestion_centroids
+        meta_out["render_hints"] = render_hints
+
+        return InferenceResponse(suggestions=filtered_suggestions, meta=meta_out)
+
+    # Fallback: previous behaviour using generated candidates
     candidates, meta = _generate_suggestions(
         sample_bbox, budget, req.max_suggestions * 3, req.preferences)
 
@@ -349,9 +503,163 @@ async def propose_region(req: ProposeRequest):
     return InferenceResponse(suggestions=filtered, meta=meta_out)
 
 
+def _load_turkana_sample() -> List[FeatureModel]:
+    """Load the bundled Turkana recommendations GeoJSON (if present) and return a
+    list of FeatureModel objects. This version will search several likely
+    locations (src/app, repo root, any .geojson in the repository) so the
+    endpoint works even if files are named differently or placed at repo root.
+    For non-Point geometries the function will create a Point geometry using
+    centroid_lon/centroid_lat properties when available so the frontend and
+    suggestion builders can work with point centroids.
+    """
+    try:
+        # primary path: src/app/turkana_recommendations_full_data.geojson
+        base = Path(__file__).resolve()
+        candidates: List[Path] = []
+        try:
+            repo_root = base.parents[4]
+        except Exception:
+            repo_root = Path.cwd()
+
+        candidates.append(
+            base.parents[2] / "turkana_recommendations_full_data.geojson")
+        candidates.append(repo_root / "export.geojson")
+        candidates.append(repo_root / "export.json")
+        candidates.append(repo_root / "data" / "areas.geojson")
+
+        # also include any .geojson file discovered under repo_root
+        for p in glob.glob(str(repo_root / "**" / "*.geojson"), recursive=True):
+            candidates.append(Path(p))
+
+        # dedupe while preserving order
+        seen = set()
+        uniq_candidates = []
+        for p in candidates:
+            sp = str(p)
+            if sp not in seen:
+                seen.add(sp)
+                uniq_candidates.append(p)
+
+        sample_path: Optional[Path] = None
+        for p in uniq_candidates:
+            if p and p.exists():
+                sample_path = p
+                break
+
+        if sample_path is None:
+            return []
+
+        with sample_path.open("r", encoding="utf-8") as fh:
+            ej = _json.load(fh)
+        out: List[FeatureModel] = []
+        for f in ej.get("features", []):
+            geom = f.get("geometry")
+            props = f.get("properties") or {}
+            # If geometry is not a Point but centroid props exist, create a Point geometry
+            if geom and geom.get("type") != "Point" and "centroid_lon" in props and "centroid_lat" in props:
+                point_geom = {"type": "Point", "coordinates": [
+                    float(props["centroid_lon"]), float(props["centroid_lat"])]}
+                out.append(FeatureModel(geometry=point_geom, properties=props))
+            else:
+                # keep geometry as-is (Point or Polygon) — FeatureModel accepts dict geometry
+                out.append(FeatureModel(geometry=geom, properties=props))
+        return out
+    except Exception:
+        return []
+
+
+def _suggestions_from_features(features: List[FeatureModel], bbox: Optional[BBox] = None, max_suggestions: int = 6) -> List[Suggestion]:
+    """Create Suggestion models from GeoJSON features (expects point geometries
+    or features converted to points by _load_turkana_sample). Filters to an
+    optional bbox. Uses a tolerant property mapping to find estimated cost,
+    urgency and impact values from features produced by different exports.
+    """
+    suggestions: List[Suggestion] = []
+
+    # candidate property keys for common fields in different datasets
+    est_cost_keys = ["estimated_cost", "est_cost", "predicted_cost", "cost",
+                     "cost_usd", "predicted_cost_usd", "estimated_cost_usd", "estimated_cost_mean"]
+    urgency_keys = ["urgency_score_normalized",
+                    "urgency", "urgency_score", "urgency_normalized"]
+    impact_keys = ["impact_per_1k_usd", "impact_per_1k", "impact_per_1000_usd",
+                   "benefit_per_1k_usd", "impact", "impact_usd_per_1k", "impact_est"]
+
+    for i, feat in enumerate(features):
+        coords = _feature_point_coords(feat)
+        if not coords:
+            continue
+        # bbox filter if provided
+        if bbox is not None:
+            if (
+                coords["lon"] < bbox.min_lon
+                or coords["lon"] > bbox.max_lon
+                or coords["lat"] < bbox.min_lat
+                or coords["lat"] > bbox.max_lat
+            ):
+                continue
+        props = feat.properties or {}
+
+        # tolerant extraction helpers
+        def _first_numeric(keys_list):
+            for k in keys_list:
+                v = props.get(k)
+                if v is None:
+                    continue
+                try:
+                    return float(v)
+                except Exception:
+                    continue
+            return 0.0
+
+        est_cost = _first_numeric(est_cost_keys)
+        urgency = _first_numeric(urgency_keys)
+        impact = _first_numeric(impact_keys)
+
+        # If no estimated cost found, try to infer from other hints (population * unit cost)
+        if est_cost == 0.0:
+            pop = None
+            try:
+                pop = float(props.get("mean_population")
+                            or props.get("population") or 0.0)
+            except Exception:
+                pop = 0.0
+            if pop and pop > 0:
+                # heuristic: cost per person fallback
+                est_cost = pop * 100.0
+
+        # Ensure values are finite and non-negative
+        est_cost = max(0.0, float(est_cost or 0.0))
+        urgency = max(0.0, min(1.0, float(urgency or 0.0)))
+        impact = max(0.0, float(impact or 0.0))
+
+        # simple combined score: urgency (0-1) plus small fraction of impact (scaled)
+        score = max(0.0, min(1.0, urgency + min(1.0, impact / 100.0)))
+        layout = {
+            "recommended_build_type": props.get("recommendation") or props.get("recommended_build_type"),
+            "mean_population": props.get("mean_population") or props.get("population"),
+            "mean_solar_potential": props.get("mean_solar_potential") or props.get("solar_potential"),
+        }
+        suggestions.append(
+            Suggestion(
+                id=f"turkana-{i + 1}",
+                centroid={"lon": coords["lon"], "lat": coords["lat"]},
+                estimated_cost=round(est_cost, 2),
+                score=round(score, 3),
+                layout=layout,
+                notes=props.get("justification") or props.get("notes"),
+            )
+        )
+    # sort and trim
+    suggestions.sort(key=lambda s: s.score, reverse=True)
+    return suggestions[:max_suggestions]
+
+
 def _suggestions_to_featurecollection(suggestions: List[Suggestion], bbox: Optional[BBox] = None) -> Dict[str, Any]:
     """Convert a list of Suggestion models into a GeoJSON FeatureCollection where
     each feature represents the suggestion centroid with useful properties.
+
+    (This function remained but we added above helpers that produce Suggestion
+    objects from the Turkana dataset.)
     """
     features: List[Dict[str, Any]] = []
     for s in suggestions:
@@ -402,40 +710,92 @@ class GeodataResponse(BaseModel):
 @router.post(
     "/v1/geodata/kenya",
     response_model=GeodataResponse,
-    summary="Return geodata layers (amenities, infrastructure, data) filtered to Kenya from supplied features",
+    summary="Filter and organize geospatial features into layers for Kenya",
 )
 async def geodata_kenya(req: GeodataRequest):
-    """
-    Filter supplied point features to those inside an approximate Kenya bbox and return
-    layer-separated GeoJSON FeatureCollections that can be rendered directly by browser
-    mapping libraries (Leaflet, Mapbox GL, OpenLayers).
+    """Process and organize geospatial features for visualization in Kenya.
 
-    Usage:
+    Feature Categories:
+    1. Amenities (orange markers):
+       - Markets and shops
+       - Community facilities
+       - Public services
+       Properties examined: layer, type, category containing "amenity", "shop", "market"
+
+    2. Infrastructure (blue markers):
+       - Roads and transportation
+       - Power infrastructure
+       - Water systems
+       - Railways
+       Properties examined: layer, type, category containing "infra", "road", "power", "rail"
+
+    3. Data (green markers):
+       - Population centers
+       - Solar resource measurements
+       - Other uncategorized points
+       Default category for features not matching other rules
+
+    Input Format:
       POST /v1/geodata/kenya
-      Body: { "features": [ {"geometry": {"type":"Point","coordinates":[lon,lat]}, "properties": {...} }, ... ] }
+      {
+        "features": [
+          {
+            "geometry": {
+              "type": "Point",
+              "coordinates": [longitude, latitude]
+            },
+            "properties": {
+              "layer": "amenities",  // or "infrastructure" or inferred from type
+              "type": "market",      // or other type hints
+              "name": "...",         // optional
+              "data": { ... }        // additional properties preserved
+            }
+          },
+          ...
+        ]
+      }
 
-    Returned JSON:
+    Processing:
+    1. Features are filtered to Kenya bounds:
+       lon: 33.5°E to 42.0°E
+       lat: 5.5°S to 5.5°N
+
+    2. Features are categorized by examining properties:
+       - Explicit "layer" property
+       - Type/category property keywords
+       - Default to "data" layer
+
+    3. For each layer:
+       - Compute bounds
+       - Track feature counts
+       - Preserve all original properties
+       - Add styling hints
+
+    Response Structure:
       {
         "layers": {
-          "amenities": { "type": "FeatureCollection", "features": [...], "bbox": [min_lon,min_lat,max_lon,max_lat] },
+          "amenities": {
+            "type": "FeatureCollection",
+            "features": [...],
+            "bbox": [min_lon, min_lat, max_lon, max_lat]
+          },
           "infrastructure": { ... },
           "data": { ... }
         },
         "meta": {
           "counts": {"amenities": n, "infrastructure": m, "data": k},
           "total": n+m+k,
-          "render_hints": {"amenities": {"marker_color": "#...", "marker_radius": 6}, ...},
-          "source_bbox": {"min_lon":...,"max_lon":...,"min_lat":...,"max_lat":...}
+          "render_hints": {
+            "amenities": {"marker_color": "#FF8C00", "marker_radius": 6},
+            "infrastructure": {"marker_color": "#0077BE", "marker_radius": 6},
+            "data": {"marker_color": "#4CAF50", "marker_radius": 5}
+          },
+          "source_bbox": Kenya bounds
         }
       }
 
-    Notes:
-      - The Kenya bbox used for filtering is a simple approximation and intended only
-        as a quick client-side filter; for exact country boundaries use polygon-based
-        checking on the client or a more detailed dataset on the server.
-      - Each layer is returned as a valid GeoJSON FeatureCollection which most mapping
-        libraries can consume directly. The `render_hints` object provides simple
-        presentation guidance (colors/radii) the frontend can use when styling markers.
+    The response is directly usable by mapping libraries (Leaflet, Mapbox GL, etc.)
+    with the provided styling hints.
     """
     # Kenya approximate bbox (used for quick filtering)
     kenya_bbox = {"min_lon": 33.5, "max_lon": 42.0,
@@ -514,3 +874,186 @@ async def geodata_kenya(req: GeodataRequest):
             "render_hints": render_hints, "source_bbox": kenya_bbox}
 
     return GeodataResponse(layers=layers_out, meta=meta)
+
+
+class MapLoadRequest(BaseModel):
+    """Request to load initial map data for the frontend.
+
+    - bbox: optional area to generate suggestions for (if omitted, will be derived)
+    - max_suggestions: number of suggestions to produce
+    - include_sample_geodata: when true, attempt to load export.geojson from workspace root
+    - features: optional list of FeatureModel to include as geodata
+    """
+
+    bbox: Optional[BBox] = None
+    max_suggestions: int = Field(6, ge=1, le=100)
+    include_sample_geodata: bool = False
+    features: Optional[List[FeatureModel]] = Field(default_factory=list)
+
+
+class MapLoadResponse(BaseModel):
+    layers: Dict[str, GeoJSONFeatureCollection]
+    suggestions: List[Suggestion]
+    suggestion_centroids: GeoJSONFeatureCollection
+    meta: Dict[str, Any]
+
+
+@router.post(
+    "/v1/map_load",
+    response_model=MapLoadResponse,
+    summary="Load initial map data with features and suggestions",
+)
+async def map_load(req: MapLoadRequest):
+    """Bootstrap a map view with features, suggestions and metadata.
+
+    This endpoint combines:
+    1. GeoJSON features from the dataset and/or provided features
+    2. Build suggestions derived from feature properties
+    3. Layer organization and styling metadata
+
+    Data Sources:
+    - Primary: GeoJSON dataset (loaded if include_sample_geodata=true)
+      Contains build recommendations with:
+      - Point or Polygon geometries (polygons get centroid points)
+      - Properties like cost, impact, population, solar potential
+      - Build type recommendations and justifications
+    - Secondary: Additional features provided in request
+      Grouped into layers: amenities, infrastructure, data
+
+    Feature Processing:
+    - Points are used as-is
+    - Polygons are included with centroids for suggestion placement
+    - Features are filtered to request bbox if provided
+    - Properties are mapped flexibly (multiple field names supported)
+
+    Response Structure:
+    1. layers: GeoJSON FeatureCollections by category
+       - amenities: Markets, shops, community facilities
+       - infrastructure: Roads, power, water systems
+       - data: Other data points and measurements
+    2. suggestions: Scored build recommendations
+       - Location (centroid point)
+       - Cost and impact metrics
+       - Population and solar potential
+       - Build type recommendation
+    3. metadata:
+       - Feature counts by layer
+       - Area calculations
+       - Render hints (colors, marker sizes)
+       - Bounding boxes
+    """
+    # Start with provided features
+    provided: List[FeatureModel] = req.features or []
+
+    # Optionally try to load sample turkana_recommendations_full_data.geojson from src/app
+    if req.include_sample_geodata:
+        try:
+            sample_feats = _load_turkana_sample()
+            # add to provided list (these are FeatureModel instances already)
+            provided.extend(sample_feats)
+        except Exception:
+            pass
+
+    # If bbox not provided, attempt to derive from provided features
+    bbox = req.bbox
+    if bbox is None:
+        # collect coordinates
+        lons: List[float] = []
+        lats: List[float] = []
+        for feat in provided:
+            coords = _feature_point_coords(feat)
+            if coords:
+                lons.append(coords["lon"])
+                lats.append(coords["lat"])
+        if lons and lats:
+            bbox = BBox(min_lon=min(lons), min_lat=min(lats),
+                        max_lon=max(lons), max_lat=max(lats))
+        else:
+            # fallback to Kenya bbox used elsewhere
+            bbox = BBox(min_lon=33.5, min_lat=-5.5, max_lon=42.0, max_lat=5.5)
+
+    # Build geodata layers from provided features but *do not* re-filter to Kenya
+    layers_fc: Dict[str, List[Dict[str, Any]]] = {
+        "amenities": [], "infrastructure": [], "data": []}
+    counts: Dict[str, int] = {"amenities": 0, "infrastructure": 0, "data": 0}
+
+    for feat in provided:
+        coords = _feature_point_coords(feat)
+        if not coords:
+            # if feature is not a point but has polygon geometry and centroid props we still include original polygon in layers
+            geom = feat.geometry
+            if geom and geom.get("type") in ("Polygon", "MultiPolygon"):
+                # keep polygon geometry; attempt to use centroid props for grouping
+                props = feat.properties or {}
+                layer_name = _feature_layer(feat)
+                geo_feat = {"type": "Feature",
+                            "geometry": feat.geometry, "properties": props}
+                layers_fc[layer_name].append(geo_feat)
+                counts[layer_name] += 1
+            continue
+        # if a bbox was explicitly provided in the request, filter features to it
+        if req.bbox is not None:
+            if (
+                coords["lon"] < req.bbox.min_lon
+                or coords["lon"] > req.bbox.max_lon
+                or coords["lat"] < req.bbox.min_lat
+                or coords["lat"] > req.bbox.max_lat
+            ):
+                continue
+
+        layer_name = _feature_layer(feat)
+        geo_feat = {"type": "Feature", "geometry": feat.geometry,
+                    "properties": feat.properties or {}}
+        layers_fc[layer_name].append(geo_feat)
+        counts[layer_name] += 1
+
+    # assemble feature collections
+    layers_out: Dict[str, Dict[str, Any]] = {}
+    for k, feats in layers_fc.items():
+        layers_out[k] = {"type": "FeatureCollection", "features": feats}
+
+    total = sum(counts.values())
+
+    # generate suggestions: prefer dataset-derived suggestions if we have provided turkana features
+    turkana_feats = [f for f in provided if (
+        f.properties or {}).get("recommendation") is not None]
+    if turkana_feats:
+        suggestions = _suggestions_from_features(
+            turkana_feats, bbox=bbox, max_suggestions=req.max_suggestions)
+        s_meta = {"source": "turkana_sample",
+                  "area_km2": round(_area_size_approx_km2(bbox), 6)}
+    else:
+        suggestions, s_meta = _generate_suggestions(
+            bbox, budget=0.0, max_suggestions=req.max_suggestions, prefs={})
+
+    # convert suggestions to GeoJSON centroids
+    suggestion_centroids = _suggestions_to_featurecollection(
+        suggestions, bbox=bbox)
+
+    # render hints (consistent with other endpoints)
+    render_hints = {
+        "amenities": {"marker_color": "#FF8C00", "marker_radius": 6},
+        "infrastructure": {"marker_color": "#0077BE", "marker_radius": 6},
+        "data": {"marker_color": "#4CAF50", "marker_radius": 5},
+        "suggestions": {"marker_color": "#8A2BE2", "marker_radius": 7},
+    }
+
+    meta = {
+        "counts": counts,
+        "total": total,
+        "render_hints": render_hints,
+        "suggestion_meta": s_meta,
+        "source_bbox": {"min_lon": bbox.min_lon, "min_lat": bbox.min_lat, "max_lon": bbox.max_lon, "max_lat": bbox.max_lat},
+    }
+
+    # convert GeoJSONFeatureCollection models in response type
+    geo_collections: Dict[str, GeoJSONFeatureCollection] = {}
+    for k, v in layers_out.items():
+        fc = GeoJSONFeatureCollection(
+            features=v["features"], bbox=v.get("bbox"))
+        geo_collections[k] = fc
+
+    suggestion_fc = GeoJSONFeatureCollection(features=suggestion_centroids.get(
+        "features", []), bbox=suggestion_centroids.get("bbox"))
+
+    return MapLoadResponse(layers=geo_collections, suggestions=suggestions, suggestion_centroids=suggestion_fc, meta=meta)
